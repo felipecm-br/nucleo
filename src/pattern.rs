@@ -12,10 +12,18 @@ pub(crate) enum Status {
     Rescore,
 }
 
+/// Matching behavior variant for a column in a [`MultiPattern`].
 #[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, Ord, Default)]
 pub enum Variant {
+    /// Standard matching behavior: any specified pattern for this column must match.
     #[default]
     Default,
+    /// Optional column matching behavior.
+    ///
+    /// If patterns are specified across multiple columns, a failure to match this column
+    /// does not reject the item (its score contribution simply falls back to 0).
+    /// However, if this is the only column with a pattern specified, it functions as a filter
+    /// and must match for the item to be accepted.
     Optional,
 }
 
@@ -99,11 +107,20 @@ impl MultiPattern {
     pub fn score(&self, haystack: &[Utf32String], matcher: &mut Matcher) -> Option<u32> {
         // TODO: column weights as a feature?
         let mut score = 0;
+        let mut matched_non_empty = false;
+        let mut has_non_empty = false;
         for ((pattern, _, variant), haystack) in self.cols.iter().zip(haystack) {
+            let res = pattern.score(haystack.slice(..), matcher);
+            if !pattern.atoms.is_empty() {
+                has_non_empty = true;
+                if res.is_some() {
+                    matched_non_empty = true;
+                }
+            }
             let fallback = matches!(variant, Variant::Optional).then_some(0);
-            score += pattern.score(haystack.slice(..), matcher).or(fallback)?;
+            score += res.or(fallback)?;
         }
-        (score > 0).then_some(score)
+        (score > 0 || matched_non_empty || !has_non_empty).then_some(score)
     }
 
     pub fn is_empty(&self) -> bool {
