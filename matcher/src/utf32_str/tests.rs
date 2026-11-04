@@ -42,3 +42,19 @@ fn test_grapheme_truncation() {
     assert_eq!(s.slice(..).get(0), 'u');
     assert_eq!(s.slice(..).get(1), '\n');
 }
+
+#[test]
+fn shared_matches_ascii() {
+    let text: std::sync::Arc<str> = "src/main.rs".into();
+    let shared = Utf32String::from(text.clone());
+    assert!(matches!(shared, Utf32String::Shared(_)));
+    let owned = Utf32String::from("src/main.rs");
+    assert_eq!(shared.len(), owned.len());
+    assert_eq!(shared.slice(4..8), owned.slice(4..8));
+    assert_eq!(shared.slice_u32(..), owned.slice_u32(..));
+    assert_eq!(shared.to_string(), "src/main.rs");
+    // Non-ASCII text cannot be shared and is converted to codepoints.
+    let unicode = Utf32String::from(std::sync::Arc::<str>::from("a\u{00e9}b"));
+    assert!(matches!(unicode, Utf32String::Unicode(_)));
+    assert_eq!(unicode.len(), 3);
+}

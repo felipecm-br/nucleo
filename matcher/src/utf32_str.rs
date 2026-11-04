@@ -3,6 +3,7 @@ mod tests;
 
 use std::borrow::Cow;
 use std::ops::{Bound, RangeBounds};
+use std::sync::Arc;
 use std::{fmt, slice};
 
 use memchr::memmem;
@@ -305,6 +306,11 @@ pub enum Utf32String {
     Ascii(Box<str>),
     /// A string represented as an array of unicode codepoints (basically UTF-32).
     Unicode(Box<[char]>),
+    /// ASCII text shared with the caller, so an item whose haystack is its whole text stores
+    /// that text once. Behaves exactly like [`Utf32String::Ascii`]; the derived comparisons
+    /// still tell the two variants apart.
+    /// Correctness invariant: must only contain valid ASCII (<=127)
+    Shared(Arc<str>),
 }
 
 impl Default for Utf32String {
@@ -320,6 +326,7 @@ impl Utf32String {
         match self {
             Utf32String::Unicode(codepoints) => codepoints.len(),
             Utf32String::Ascii(ascii_bytes) => ascii_bytes.len(),
+            Utf32String::Shared(ascii_bytes) => ascii_bytes.len(),
         }
     }
 
@@ -329,6 +336,7 @@ impl Utf32String {
         match self {
             Utf32String::Unicode(codepoints) => codepoints.is_empty(),
             Utf32String::Ascii(ascii_bytes) => ascii_bytes.is_empty(),
+            Utf32String::Shared(ascii_bytes) => ascii_bytes.is_empty(),
         }
     }
 
@@ -348,6 +356,7 @@ impl Utf32String {
         };
         match self {
             Utf32String::Ascii(bytes) => Utf32Str::Ascii(&bytes.as_bytes()[start..end]),
+            Utf32String::Shared(bytes) => Utf32Str::Ascii(&bytes.as_bytes()[start..end]),
             Utf32String::Unicode(codepoints) => Utf32Str::Unicode(&codepoints[start..end]),
         }
     }
@@ -368,6 +377,9 @@ impl Utf32String {
         };
         match self {
             Utf32String::Ascii(bytes) => {
+                Utf32Str::Ascii(&bytes.as_bytes()[start as usize..end as usize])
+            }
+            Utf32String::Shared(bytes) => {
                 Utf32Str::Ascii(&bytes.as_bytes()[start as usize..end as usize])
             }
             Utf32String::Unicode(codepoints) => {
@@ -392,6 +404,18 @@ impl From<Box<str>> for Utf32String {
     fn from(value: Box<str>) -> Self {
         if has_ascii_graphemes(&value) {
             Self::Ascii(value)
+        } else {
+            Self::Unicode(chars::graphemes(&value).collect())
+        }
+    }
+}
+
+/// Shares `value` when it is ASCII (see [`Utf32String::Shared`]); otherwise converts it to
+/// codepoints like the other `From` impls.
+impl From<Arc<str>> for Utf32String {
+    fn from(value: Arc<str>) -> Self {
+        if has_ascii_graphemes(&value) {
+            Self::Shared(value)
         } else {
             Self::Unicode(chars::graphemes(&value).collect())
         }
