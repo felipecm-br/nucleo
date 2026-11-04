@@ -99,12 +99,13 @@ impl<T> Vec<T> {
                 .entries
                 .load(Ordering::Relaxed);
             debug_assert!(!entries.is_null());
-            let entry = Bucket::<T>::get(entries, location.entry, self.columns);
+            let entry =
+                Bucket::<T>::get(entries, location.entry, location.bucket_len, self.columns);
             // this looks odd but is necessary to ensure cross
             // thread synchronization (essentially acting as a memory barrier)
             // since the caller must only guarantee that he has observed active on any thread
             // but the current thread might still have an old value cached (although unlikely)
-            let _ = (*entry).active.load(Ordering::Acquire);
+            let _ = Bucket::<T>::active(entries, location.entry).load(Ordering::Acquire);
             Entry::read(entry, self.columns)
         }
     }
@@ -127,11 +128,11 @@ impl<T> Vec<T> {
             }
 
             // safety: `location.entry` is always in bounds for it's bucket
-            let entry = Bucket::<T>::get(entries, location.entry, self.columns);
+            let entry =
+                Bucket::<T>::get(entries, location.entry, location.bucket_len, self.columns);
 
             // safety: the entry is active
-            (*entry)
-                .active
+            Bucket::<T>::active(entries, location.entry)
                 .load(Ordering::Acquire)
                 .then(|| Entry::read(entry, self.columns))
         }
@@ -162,7 +163,7 @@ impl<T> Vec<T> {
 
         unsafe {
             // safety: `location.entry` is always in bounds for it's bucket
-            let entry = Bucket::get(entries, location.entry, self.columns);
+            let entry = Bucket::get(entries, location.entry, location.bucket_len, self.columns);
 
             // safety: we have unique access to this entry.
             //
@@ -177,7 +178,7 @@ impl<T> Vec<T> {
             fill_columns(&value, Entry::matcher_cols_mut(entry, self.columns));
             (*entry).slot.get().write(MaybeUninit::new(value));
             // let other threads know that this entry is active
-            (*entry).active.store(true, Ordering::Release);
+            Bucket::<T>::active(entries, location.entry).store(true, Ordering::Release);
         }
 
         index
@@ -258,7 +259,7 @@ impl<T> Vec<T> {
             }
 
             unsafe {
-                let entry = Bucket::get(entries, location.entry, self.columns);
+                let entry = Bucket::get(entries, location.entry, location.bucket_len, self.columns);
 
                 // Initialize matcher columns
                 for col in Entry::matcher_cols_raw(entry, self.columns) {
@@ -266,7 +267,7 @@ impl<T> Vec<T> {
                 }
                 fill_columns(&v, Entry::matcher_cols_mut(entry, self.columns));
                 (*entry).slot.get().write(MaybeUninit::new(v));
-                (*entry).active.store(true, Ordering::Release);
+                Bucket::<T>::active(entries, location.entry).store(true, Ordering::Release);
             }
         }
     }
@@ -387,14 +388,21 @@ impl<'v, T> Iterator for Iter<'v, T> {
                     return Some((index, None));
                 }
                 // safety: bounds and null checked above
-                let entry = unsafe { Bucket::get(entries, self.location.entry, self.vec.columns) };
+                let entry = unsafe {
+                    Bucket::get(
+                        entries,
+                        self.location.entry,
+                        self.location.bucket_len,
+                        self.vec.columns,
+                    )
+                };
+                let active = unsafe { Bucket::<T>::active(entries, self.location.entry) };
                 let index = self.idx;
                 self.location.entry += 1;
                 self.idx += 1;
 
                 let entry = unsafe {
-                    (*entry)
-                        .active
+                    active
                         .load(Ordering::Acquire)
                         .then(|| Entry::read(entry, self.vec.columns))
                 };
@@ -507,32 +515,39 @@ struct Bucket<T> {
 }
 
 impl<T> Bucket<T> {
-    fn layout(len: u32, layout: Layout) -> Layout {
-        Layout::from_size_align(layout.size() * len as usize, layout.align())
+    /// A bucket is one allocation: `len` `active` flags, then `len` entries. Keeping the flags
+    /// apart means initializing them touches `len` bytes; the entries' pages stay untouched (and
+    /// out of the resident set) until an entry is written. With the flags inside each entry,
+    /// allocating the next bucket ahead of time made all of it resident at once, which for a
+    /// 2M-item input was about 200 MB of memory holding nothing.
+    fn layout(len: u32, entry: Layout) -> (Layout, usize) {
+        let flags =
+            Layout::array::<AtomicBool>(len as usize).expect("exceeded maximum allocation size");
+        let entries = Layout::from_size_align(entry.size() * len as usize, entry.align())
+            .expect("exceeded maximum allocation size");
+        flags
+            .extend(entries)
             .expect("exceeded maximum allocation size")
     }
 
     unsafe fn alloc(len: u32, cols: u32) -> *mut Entry<T> {
-        let layout = Entry::<T>::layout(cols);
-        let arr_layout = Self::layout(len, layout);
-        let entries = std::alloc::alloc(arr_layout);
-        if entries.is_null() {
+        let (arr_layout, _) = Self::layout(len, Entry::<T>::layout(cols));
+        let base = std::alloc::alloc(arr_layout);
+        if base.is_null() {
             std::alloc::handle_alloc_error(arr_layout)
         }
-
-        for i in 0..len {
-            let active = entries.add(i as usize * layout.size()) as *mut AtomicBool;
-            active.write(AtomicBool::new(false))
+        let flags = base as *mut AtomicBool;
+        for i in 0..len as usize {
+            flags.add(i).write(AtomicBool::new(false))
         }
-        entries as *mut Entry<T>
+        base as *mut Entry<T>
     }
 
     unsafe fn dealloc(entries: *mut Entry<T>, len: u32, cols: u32) {
-        let layout = Entry::<T>::layout(cols);
-        let arr_layout = Self::layout(len, layout);
+        let (arr_layout, _) = Self::layout(len, Entry::<T>::layout(cols));
         for i in 0..len {
-            let entry = Bucket::get(entries, i, cols);
-            if *(*entry).active.get_mut() {
+            if Self::active(entries, i).load(Ordering::Relaxed) {
+                let entry = Bucket::get(entries, i, len, cols);
                 ptr::drop_in_place((*(*entry).slot.get()).as_mut_ptr());
                 for matcher_col in Entry::matcher_cols_raw(entry, cols) {
                     ptr::drop_in_place((*matcher_col.get()).as_mut_ptr());
@@ -542,10 +557,17 @@ impl<T> Bucket<T> {
         std::alloc::dealloc(entries as *mut u8, arr_layout)
     }
 
-    unsafe fn get(entries: *mut Entry<T>, idx: u32, cols: u32) -> *mut Entry<T> {
+    /// The entry at `idx` of a bucket of `len` entries allocated at `entries`.
+    unsafe fn get(entries: *mut Entry<T>, idx: u32, len: u32, cols: u32) -> *mut Entry<T> {
         let layout = Entry::<T>::layout(cols);
+        let (_, offset) = Self::layout(len, layout);
         let ptr = entries as *mut u8;
-        ptr.add(layout.size() * idx as usize) as *mut Entry<T>
+        ptr.add(offset + layout.size() * idx as usize) as *mut Entry<T>
+    }
+
+    /// Whether the entry at `idx` has been written (see [`Bucket::layout`]).
+    unsafe fn active<'a>(entries: *mut Entry<T>, idx: u32) -> &'a AtomicBool {
+        &*(entries as *const AtomicBool).add(idx as usize)
     }
 
     fn new(entries: *mut Entry<T>) -> Bucket<T> {
@@ -557,7 +579,6 @@ impl<T> Bucket<T> {
 
 #[repr(C)]
 struct Entry<T> {
-    active: AtomicBool,
     slot: UnsafeCell<MaybeUninit<T>>,
     tail: [UnsafeCell<MaybeUninit<Utf32String>>; 0],
 }
