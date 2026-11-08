@@ -1,6 +1,5 @@
 use std::cell::UnsafeCell;
-use std::mem::take;
-use std::sync::atomic::{self, AtomicBool, AtomicU32};
+use std::sync::atomic::{self, AtomicBool};
 use std::sync::Arc;
 
 use nucleo_matcher::Config;
@@ -91,7 +90,7 @@ impl<T: Sync + Send + 'static> Worker<T> {
         (pool, worker)
     }
 
-    unsafe fn process_new_items(&mut self, unmatched: &AtomicU32) {
+    unsafe fn process_new_items(&mut self) {
         let matchers = &self.matchers;
         let pattern = &self.pattern;
         self.matches.reserve(self.in_flight.len());
@@ -111,7 +110,6 @@ impl<T: Sync + Send + 'static> Worker<T> {
             let items = new_snapshot.map(|(idx, item)| {
                 let Some(item) = item else {
                     in_flight.lock().push(idx);
-                    unmatched.fetch_add(1, atomic::Ordering::Relaxed);
                     return Match {
                         score: 0,
                         idx: u32::MAX,
@@ -121,7 +119,6 @@ impl<T: Sync + Send + 'static> Worker<T> {
                     return Match { score: 0, idx };
                 }
                 let Some(score) = pattern.score(item.matcher_columns, matchers.get()) else {
-                    unmatched.fetch_add(1, atomic::Ordering::Relaxed);
                     return Match {
                         score: 0,
                         idx: u32::MAX,
@@ -189,7 +186,6 @@ impl<T: Sync + Send + 'static> Worker<T> {
             self.reset_matches();
         }
 
-        let mut unmatched = AtomicU32::new(0);
         if pattern_status != pattern::Status::Unchanged && !self.matches.is_empty() {
             self.process_new_items_trivial();
             let matchers = &self.matchers;
@@ -200,7 +196,6 @@ impl<T: Sync + Send + 'static> Worker<T> {
                 .for_each(|match_| {
                     if match_.idx == u32::MAX {
                         debug_assert_eq!(match_.score, 0);
-                        unmatched.fetch_add(1, atomic::Ordering::Relaxed);
                         return;
                     }
                     // safety: in-flight items are never added to the matches
@@ -208,21 +203,31 @@ impl<T: Sync + Send + 'static> Worker<T> {
                     if let Some(score) = pattern.score(item.matcher_columns, matchers.get()) {
                         match_.score = score;
                     } else {
-                        unmatched.fetch_add(1, atomic::Ordering::Relaxed);
                         match_.score = 0;
                         match_.idx = u32::MAX;
                     }
                 });
         } else {
-            self.process_new_items(&unmatched);
+            self.process_new_items();
         }
 
         let canceled = self.sort_matches();
         if canceled {
             self.was_canceled = true;
         } else {
-            self.matches
-                .truncate(self.matches.len() - take(unmatched.get_mut()) as usize);
+            // Unmatched entries have `idx == u32::MAX` and sort last. They are counted here, in
+            // one pass, rather than with a shared atomic per entry while matching: with every
+            // worker thread bumping the same counter, a query matching few of millions of items
+            // spent most of its CPU time moving that cache line between cores.
+            let unmatched = self
+                .matches
+                .par_iter()
+                .filter(|match_| match_.idx == u32::MAX)
+                .count();
+            debug_assert!(self.matches[self.matches.len() - unmatched..]
+                .iter()
+                .all(|match_| match_.idx == u32::MAX));
+            self.matches.truncate(self.matches.len() - unmatched);
             if self.should_notify.load(atomic::Ordering::Relaxed) {
                 (self.notify)();
             }

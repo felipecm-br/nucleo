@@ -38,14 +38,22 @@ fn multi_pattern_scoring_negative_and_optional() {
     // 3. Optional column only, non-matching -> must reject
     let mut pat3 = MultiPattern::new(2);
     pat3.configure_column(1, Variant::Optional);
-    pat3.reparse(1, "nomatch", CaseMatching::Smart, Normalization::Smart, false);
+    pat3.reparse(
+        1,
+        "nomatch",
+        CaseMatching::Smart,
+        Normalization::Smart,
+        false,
+    );
     assert_eq!(pat3.score(&haystack_clean, &mut matcher), None);
 
     // 4. Optional column only, matching -> must accept with score > 0
     let mut pat4 = MultiPattern::new(2);
     pat4.configure_column(1, Variant::Optional);
     pat4.reparse(1, "extra", CaseMatching::Smart, Normalization::Smart, false);
-    assert!(pat4.score(&haystack_clean, &mut matcher).is_some_and(|s| s > 0));
+    assert!(pat4
+        .score(&haystack_clean, &mut matcher)
+        .is_some_and(|s| s > 0));
 
     // 5. Empty pattern across all columns -> matches with Some(0)
     let pat5 = MultiPattern::new(2);
