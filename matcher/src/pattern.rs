@@ -154,7 +154,7 @@ impl Atom {
             if append_dollar {
                 needle.push('$');
             }
-            Utf32String::Ascii(needle.into_boxed_str())
+            Utf32String::from_ascii(needle.into_boxed_str())
         } else {
             let mut needle_ = Vec::with_capacity(needle.len());
             #[cfg(feature = "unicode-casefold")]
@@ -225,7 +225,7 @@ impl Atom {
             if append_dollar {
                 needle_.push('$');
             }
-            Utf32String::Unicode(needle_.into_boxed_slice())
+            Utf32String::from_codepoints(needle_.into_boxed_slice())
         };
         Atom {
             kind,

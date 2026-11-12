@@ -15,17 +15,17 @@ use std::{fmt, mem};
 /// offset and length. The chunk lives as long as any slice of it.
 #[derive(Clone)]
 pub struct SharedStr {
-    chunk: Arc<Chunk>,
-    start: u32,
-    len: u32,
+    pub(crate) chunk: Arc<Chunk>,
+    pub(crate) start: u32,
+    pub(crate) len: u32,
 }
 
 const _: () = assert!(mem::size_of::<SharedStr>() == 16);
 
 /// The text behind [`SharedStr`]s, with whether it can be matched as plain ASCII (see
 /// [`SharedStr::is_ascii_graphemes`]), worked out once for the whole chunk.
-struct Chunk {
-    text: Box<str>,
+pub(crate) struct Chunk {
+    pub(crate) text: Box<str>,
     ascii: bool,
 }
 

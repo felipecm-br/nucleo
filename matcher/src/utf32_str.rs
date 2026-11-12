@@ -2,13 +2,16 @@
 mod tests;
 
 use std::borrow::Cow;
+use std::hash::{Hash, Hasher};
 use std::ops::{Bound, RangeBounds};
+use std::ptr::NonNull;
 use std::sync::Arc;
-use std::{fmt, slice};
+use std::{fmt, mem, slice};
 
 use memchr::memmem;
 
 use crate::chars;
+use crate::shared_str::Chunk;
 use crate::SharedStr;
 
 /// Check if a given string can be represented internally as the `Ascii` variant in a
@@ -297,49 +300,150 @@ impl DoubleEndedIterator for Chars<'_> {
     }
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Hash)]
 /// An owned version of [`Utf32Str`].
 ///
 /// See the API documentation for [`Utf32Str`] for more detail.
-pub enum Utf32String {
-    /// A string represented as ASCII encoded bytes.
-    /// Correctness invariant: must only contain valid ASCII (<=127)
-    Ascii(Box<str>),
-    /// A string represented as an array of unicode codepoints (basically UTF-32).
-    Unicode(Box<[char]>),
-    /// ASCII text shared with the caller, so an item whose haystack is its whole text stores
-    /// that text once, and many items can keep their text in one chunk (see [`SharedStr`]).
-    /// Behaves exactly like [`Utf32String::Ascii`]; the derived comparisons still tell the
-    /// two variants apart.
-    /// Correctness invariant: must only contain valid ASCII (<=127)
-    Shared(SharedStr),
+///
+/// It holds one of three kinds of text, all matched the same way:
+///
+/// - ASCII bytes it owns ([`Utf32String::from_ascii`]),
+/// - unicode codepoints it owns, basically UTF-32 ([`Utf32String::from_codepoints`]),
+/// - ASCII text shared with the caller ([`SharedStr`]), so an item whose haystack is its whole
+///   text stores that text once, and many items can keep their text in one chunk.
+///
+/// It is two words, so a matcher with millions of items spends 16 bytes per column on it: a
+/// pointer, the length, and either the shared text's offset in its chunk or a tag saying
+/// which of the owned kinds it is. The comparisons tell the three kinds apart.
+pub struct Utf32String {
+    /// The owned bytes or codepoints, or the [`Chunk`] behind a shared string.
+    ptr: NonNull<u8>,
+    /// The length in bytes (ASCII) or codepoints.
+    len: u32,
+    /// [`ASCII`] or [`UNICODE`] for owned text, otherwise the offset of shared text in its
+    /// chunk, which is always below both tags.
+    start: u32,
 }
 
-impl Default for Utf32String {
-    fn default() -> Self {
-        Self::Ascii(String::new().into_boxed_str())
-    }
+const ASCII: u32 = u32::MAX;
+const UNICODE: u32 = u32::MAX - 1;
+
+const _: () = assert!(mem::size_of::<Utf32String>() == 16);
+const _: () = assert!(mem::size_of::<Option<Utf32String>>() == 16);
+
+// SAFETY: a `Utf32String` owns a `Box<str>`, a `Box<[char]>` or an `Arc<Chunk>`, which are
+// all `Send` and `Sync`.
+unsafe impl Send for Utf32String {}
+unsafe impl Sync for Utf32String {}
+
+/// The text of a [`Utf32String`], by kind.
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Text<'a> {
+    Ascii(&'a str),
+    Unicode(&'a [char]),
+    Shared(&'a str),
+}
+
+#[inline]
+fn len_u32(len: usize) -> u32 {
+    u32::try_from(len).expect("a Utf32String is limited to u32::MAX bytes or codepoints")
 }
 
 impl Utf32String {
+    /// A string of owned ASCII text.
+    ///
+    /// Correctness invariant: `text` must only contain valid ASCII (<=127) without `\r\n`;
+    /// use a `From` impl to convert any text.
+    ///
+    /// # Panics
+    ///
+    /// If `text` is longer than `u32::MAX` bytes.
+    #[inline]
+    pub fn from_ascii(text: Box<str>) -> Self {
+        let len = len_u32(text.len());
+        // SAFETY: `Box::into_raw` never returns null.
+        let ptr = unsafe { NonNull::new_unchecked(Box::into_raw(text) as *mut u8) };
+        Self {
+            ptr,
+            len,
+            start: ASCII,
+        }
+    }
+
+    /// A string of owned unicode codepoints, one per grapheme.
+    ///
+    /// # Panics
+    ///
+    /// If `codepoints` holds more than `u32::MAX` codepoints.
+    #[inline]
+    pub fn from_codepoints(codepoints: Box<[char]>) -> Self {
+        let len = len_u32(codepoints.len());
+        // SAFETY: `Box::into_raw` never returns null.
+        let ptr = unsafe { NonNull::new_unchecked(Box::into_raw(codepoints) as *mut u8) };
+        Self {
+            ptr,
+            len,
+            start: UNICODE,
+        }
+    }
+
+    #[inline]
+    fn text(&self) -> Text<'_> {
+        // SAFETY: each constructor stores a pointer and length taken from a live allocation of
+        // the kind `start` names, which this string owns until it is dropped.
+        unsafe {
+            match self.start {
+                ASCII => Text::Ascii(std::str::from_utf8_unchecked(slice::from_raw_parts(
+                    self.ptr.as_ptr(),
+                    self.len as usize,
+                ))),
+                UNICODE => Text::Unicode(slice::from_raw_parts(
+                    self.ptr.as_ptr() as *const char,
+                    self.len as usize,
+                )),
+                start => {
+                    let chunk = &*(self.ptr.as_ptr() as *const Chunk);
+                    // `start..start + len` was in bounds and on char boundaries of the chunk
+                    // when the `SharedStr` was made, and the chunk never changes.
+                    Text::Shared(
+                        chunk
+                            .text
+                            .get_unchecked(start as usize..(start + self.len) as usize),
+                    )
+                }
+            }
+        }
+    }
+
+    /// The shared text this string matches, when it shares a [`SharedStr`]'s chunk.
+    #[inline]
+    pub fn shared(&self) -> Option<SharedStr> {
+        if self.start >= UNICODE {
+            return None;
+        }
+        let ptr = self.ptr.as_ptr() as *const Chunk;
+        // SAFETY: `ptr` came from `Arc::into_raw` and this string holds one strong count, so
+        // the chunk is live; the count is raised for the new `Arc` first.
+        let chunk = unsafe {
+            Arc::increment_strong_count(ptr);
+            Arc::from_raw(ptr)
+        };
+        Some(SharedStr {
+            chunk,
+            start: self.start,
+            len: self.len,
+        })
+    }
+
     /// Returns the number of characters in this string.
     #[inline]
     pub fn len(&self) -> usize {
-        match self {
-            Utf32String::Unicode(codepoints) => codepoints.len(),
-            Utf32String::Ascii(ascii_bytes) => ascii_bytes.len(),
-            Utf32String::Shared(ascii_bytes) => ascii_bytes.len(),
-        }
+        self.len as usize
     }
 
     /// Returns whether this string is empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        match self {
-            Utf32String::Unicode(codepoints) => codepoints.is_empty(),
-            Utf32String::Ascii(ascii_bytes) => ascii_bytes.is_empty(),
-            Utf32String::Shared(ascii_bytes) => ascii_bytes.is_empty(),
-        }
+        self.len == 0
     }
 
     /// Creates a slice with a string that contains the characters in
@@ -356,10 +460,11 @@ impl Utf32String {
             Bound::Excluded(&end) => end,
             Bound::Unbounded => self.len(),
         };
-        match self {
-            Utf32String::Ascii(bytes) => Utf32Str::Ascii(&bytes.as_bytes()[start..end]),
-            Utf32String::Shared(bytes) => Utf32Str::Ascii(&bytes.as_bytes()[start..end]),
-            Utf32String::Unicode(codepoints) => Utf32Str::Unicode(&codepoints[start..end]),
+        match self.text() {
+            Text::Ascii(bytes) | Text::Shared(bytes) => {
+                Utf32Str::Ascii(&bytes.as_bytes()[start..end])
+            }
+            Text::Unicode(codepoints) => Utf32Str::Unicode(&codepoints[start..end]),
         }
     }
 
@@ -375,19 +480,95 @@ impl Utf32String {
         let end = match range.end_bound() {
             Bound::Included(&end) => end + 1,
             Bound::Excluded(&end) => end,
-            Bound::Unbounded => self.len() as u32,
+            Bound::Unbounded => self.len,
         };
-        match self {
-            Utf32String::Ascii(bytes) => {
-                Utf32Str::Ascii(&bytes.as_bytes()[start as usize..end as usize])
-            }
-            Utf32String::Shared(bytes) => {
-                Utf32Str::Ascii(&bytes.as_bytes()[start as usize..end as usize])
-            }
-            Utf32String::Unicode(codepoints) => {
-                Utf32Str::Unicode(&codepoints[start as usize..end as usize])
+        self.slice(start as usize..end as usize)
+    }
+}
+
+impl Drop for Utf32String {
+    fn drop(&mut self) {
+        let ptr = self.ptr.as_ptr();
+        let len = self.len as usize;
+        // SAFETY: the pointer and length came from the `into_raw` of the kind `start` names,
+        // and this string owns that allocation (or one strong count of the chunk).
+        unsafe {
+            match self.start {
+                ASCII => drop(Box::from_raw(
+                    std::ptr::slice_from_raw_parts_mut(ptr, len) as *mut str
+                )),
+                UNICODE => drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                    ptr as *mut char,
+                    len,
+                ))),
+                _ => drop(Arc::from_raw(ptr as *const Chunk)),
             }
         }
+    }
+}
+
+impl Clone for Utf32String {
+    fn clone(&self) -> Self {
+        match self.text() {
+            Text::Ascii(text) => Self::from_ascii(text.into()),
+            Text::Unicode(codepoints) => Self::from_codepoints(codepoints.into()),
+            Text::Shared(_) => {
+                let shared = self.shared();
+                // `shared` is `Some` for shared text.
+                Self::from_shared(shared.unwrap_or_default())
+            }
+        }
+    }
+}
+
+impl PartialEq for Utf32String {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.text() == other.text()
+    }
+}
+
+impl Eq for Utf32String {}
+
+impl PartialOrd for Utf32String {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Utf32String {
+    #[inline]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.text().cmp(&other.text())
+    }
+}
+
+impl Hash for Utf32String {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.text().hash(state)
+    }
+}
+
+impl Default for Utf32String {
+    fn default() -> Self {
+        Self::from_ascii(Box::default())
+    }
+}
+
+impl Utf32String {
+    /// Shares `value`, which must be ASCII graphemes.
+    #[inline]
+    fn from_shared(value: SharedStr) -> Self {
+        let SharedStr { chunk, start, len } = value;
+        if start >= UNICODE {
+            // Only an empty string at the very end of a 4 GiB chunk gets here.
+            return Self::from_ascii(Box::default());
+        }
+        // SAFETY: `Arc::into_raw` never returns null.
+        let ptr = unsafe { NonNull::new_unchecked(Arc::into_raw(chunk) as *mut u8) };
+        Self { ptr, len, start }
     }
 }
 
@@ -395,9 +576,9 @@ impl From<&str> for Utf32String {
     #[inline]
     fn from(value: &str) -> Self {
         if has_ascii_graphemes(value) {
-            Self::Ascii(value.to_owned().into_boxed_str())
+            Self::from_ascii(value.into())
         } else {
-            Self::Unicode(chars::graphemes(value).collect())
+            Self::from_codepoints(chars::graphemes(value).collect())
         }
     }
 }
@@ -405,21 +586,21 @@ impl From<&str> for Utf32String {
 impl From<Box<str>> for Utf32String {
     fn from(value: Box<str>) -> Self {
         if has_ascii_graphemes(&value) {
-            Self::Ascii(value)
+            Self::from_ascii(value)
         } else {
-            Self::Unicode(chars::graphemes(&value).collect())
+            Self::from_codepoints(chars::graphemes(&value).collect())
         }
     }
 }
 
-/// Shares `value` when it is ASCII (see [`Utf32String::Shared`]); otherwise converts it to
-/// codepoints like the other `From` impls.
+/// Shares `value` when it is ASCII; otherwise converts it to codepoints like the other `From`
+/// impls.
 impl From<SharedStr> for Utf32String {
     fn from(value: SharedStr) -> Self {
         if value.is_ascii_graphemes() {
-            Self::Shared(value)
+            Self::from_shared(value)
         } else {
-            Self::Unicode(chars::graphemes(&value).collect())
+            Self::from_codepoints(chars::graphemes(&value).collect())
         }
     }
 }
