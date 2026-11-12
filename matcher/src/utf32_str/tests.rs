@@ -45,8 +45,8 @@ fn test_grapheme_truncation() {
 
 #[test]
 fn shared_matches_ascii() {
-    let text: std::sync::Arc<str> = "src/main.rs".into();
-    let shared = Utf32String::from(text.clone());
+    let chunk = crate::SharedChunk::new("src/main.rs\nother");
+    let shared = Utf32String::from(chunk.slice(0..11));
     assert!(matches!(shared, Utf32String::Shared(_)));
     let owned = Utf32String::from("src/main.rs");
     assert_eq!(shared.len(), owned.len());
@@ -54,7 +54,13 @@ fn shared_matches_ascii() {
     assert_eq!(shared.slice_u32(..), owned.slice_u32(..));
     assert_eq!(shared.to_string(), "src/main.rs");
     // Non-ASCII text cannot be shared and is converted to codepoints.
-    let unicode = Utf32String::from(std::sync::Arc::<str>::from("a\u{00e9}b"));
+    let unicode = Utf32String::from(crate::SharedStr::from("a\u{00e9}b"));
     assert!(matches!(unicode, Utf32String::Unicode(_)));
     assert_eq!(unicode.len(), 3);
+}
+
+#[test]
+fn arc_str_is_copied() {
+    let text: std::sync::Arc<str> = "src/main.rs".into();
+    assert!(matches!(Utf32String::from(text), Utf32String::Ascii(_)));
 }

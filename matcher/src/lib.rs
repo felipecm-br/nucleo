@@ -93,12 +93,14 @@ mod matrix;
 pub mod pattern;
 mod prefilter;
 mod score;
+mod shared_str;
 mod utf32_str;
 
 #[cfg(test)]
 mod tests;
 
 pub use crate::config::Config;
+pub use crate::shared_str::{SharedChunk, SharedStr};
 pub use crate::utf32_str::{Utf32Str, Utf32String};
 
 use crate::chars::{AsciiChar, Char};

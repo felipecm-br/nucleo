@@ -9,6 +9,7 @@ use std::{fmt, slice};
 use memchr::memmem;
 
 use crate::chars;
+use crate::SharedStr;
 
 /// Check if a given string can be represented internally as the `Ascii` variant in a
 /// [`Utf32String`] or a [`Utf32Str`].
@@ -18,7 +19,7 @@ use crate::chars;
 /// The additional carriage return check is required since even for strings consisting only
 /// of ASCII, the windows-style newline `\r\n` is treated as a single grapheme.
 #[inline]
-fn has_ascii_graphemes(string: &str) -> bool {
+pub(crate) fn has_ascii_graphemes(string: &str) -> bool {
     string.is_ascii() && memmem::find(string.as_bytes(), b"\r\n").is_none()
 }
 
@@ -307,10 +308,11 @@ pub enum Utf32String {
     /// A string represented as an array of unicode codepoints (basically UTF-32).
     Unicode(Box<[char]>),
     /// ASCII text shared with the caller, so an item whose haystack is its whole text stores
-    /// that text once. Behaves exactly like [`Utf32String::Ascii`]; the derived comparisons
-    /// still tell the two variants apart.
+    /// that text once, and many items can keep their text in one chunk (see [`SharedStr`]).
+    /// Behaves exactly like [`Utf32String::Ascii`]; the derived comparisons still tell the
+    /// two variants apart.
     /// Correctness invariant: must only contain valid ASCII (<=127)
-    Shared(Arc<str>),
+    Shared(SharedStr),
 }
 
 impl Default for Utf32String {
@@ -412,13 +414,21 @@ impl From<Box<str>> for Utf32String {
 
 /// Shares `value` when it is ASCII (see [`Utf32String::Shared`]); otherwise converts it to
 /// codepoints like the other `From` impls.
-impl From<Arc<str>> for Utf32String {
-    fn from(value: Arc<str>) -> Self {
-        if has_ascii_graphemes(&value) {
+impl From<SharedStr> for Utf32String {
+    fn from(value: SharedStr) -> Self {
+        if value.is_ascii_graphemes() {
             Self::Shared(value)
         } else {
             Self::Unicode(chars::graphemes(&value).collect())
         }
+    }
+}
+
+/// Copies `value`; use [`SharedStr`] to share the text instead.
+impl From<Arc<str>> for Utf32String {
+    #[inline]
+    fn from(value: Arc<str>) -> Self {
+        (*value).into()
     }
 }
 

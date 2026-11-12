@@ -36,7 +36,7 @@ use rayon::ThreadPool;
 
 use crate::pattern::MultiPattern;
 use crate::worker::Worker;
-pub use nucleo_matcher::{chars, Config, Matcher, Utf32Str, Utf32String};
+pub use nucleo_matcher::{chars, Config, Matcher, SharedChunk, SharedStr, Utf32Str, Utf32String};
 
 mod boxcar;
 mod par_sort;
